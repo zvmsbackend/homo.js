@@ -3,6 +3,7 @@
 (require racket/match
          racket/stream
          racket/list
+         racket/cmdline
          racketscript/interop
          racketscript/browser)
 
@@ -64,27 +65,28 @@
              (stream op-stack)
              empty-stream))]
       [else
-       (let* ([return empty-stream]
-              [return (if (<= a (/ len 2))
-                          (stream-append (loop (+ a 1) b (cons 'push op-stack)) return)
-                          return)]
+       (let* ([return (if (<= a (/ len 2))
+                          (stream-lazy (loop (+ a 1) b (cons 'push op-stack)))
+                          empty-stream)]
               [return (if (> a (+ b 1))
                           (for/fold ([return return])
-                                    ([op '(+ - * /)])
-                            (stream-append (loop a (+ b 1) (cons op op-stack)) return))
+                                    ([op (in-list '(+ - * /))])
+                            (stream-append (stream-lazy (loop a (+ b 1) (cons op op-stack))) return))
                           return)]
               [return (for/fold ([return return])
                                 ([i (in-naturals)]
                                  #:break (or (> (+ a i 1) (quotient len 2)) (< a (- b 2))))
-                        (stream-append (loop (+ a i 2) (+ b i 1)
-                                             (append (build-list (+ i 1) (lambda (i) 'cons))
-                                                     (build-list (+ i 2) (lambda (i) 'push))
-                                                     op-stack)) return))])
+                        (stream-append (stream-lazy (loop (+ a i 2) (+ b i 1)
+                                                          (append (build-list (+ i 1) (lambda (i) 'cons))
+                                                                  (build-list (+ i 2) (lambda (i) 'push))
+                                                                  op-stack))) return))])
          return)])))
 
 (define (prove source target)
   (define result (prove-all source target))
-  (or (stream-empty? result) (stream-first result)))
+  (if (stream-empty? result)
+      #f
+      (stream-first result)))
 
 (define (get-ints s)
   (reverse (for/list ([c s]
@@ -92,25 +94,26 @@
              (bitwise-xor (char->integer c) 48))))
 
 (define (stream-append s1 s2)
-  (do ([s1 s1 (stream-rest s1)]
-       [s2 s2 (stream-cons (stream-first s1) s2)])
-    ((stream-empty? s1) s2)))
+  (if (stream-empty? s1)
+    s2
+    (stream-cons (stream-first s1) (stream-append (stream-rest s1) s2))))
 
+(define Date ($ ($ 'window) 'Date))
 (define (sexp->html sexp)
   (match sexp
     [(list tag-name (list [list attr-name attr-val] ...) children ...)
-     (define node
-       ($$ document.createElement (symbol->string tag-name)))
-     (for-each (lambda (name val)
-                 ($$ node.setAttribute (symbol->string name) val))
-               attr-name
-               attr-val)
-     (for-each (lambda (child)
-                 ($$ node.append child))
-               (map sexp->html children))
-     node]
+    (define node
+      ($$ document.createElement (symbol->string tag-name)))
+    (for-each (lambda (name val)
+                ($$ node.setAttribute (symbol->string name) val))
+              attr-name
+              attr-val)
+    (for-each (lambda (child)
+                ($$ node.append child))
+              (map sexp->html children))
+    node]
     [(list tag-name children ...)
-     (sexp->html `(,tag-name () ,@children))]
+    (sexp->html `(,tag-name () ,@children))]
     [(? number? val) (number->string val)]
     [_ sexp]))
 
@@ -121,14 +124,14 @@
                                           [type "number"]
                                           [value 0]))))
 (define all-input (sexp->html '(input ([class "form-check-input"]
-                                       [type "checkbox"]))))
+                                      [type "checkbox"]))))
 (define result-div (make-parameter (sexp->html '(div))))
 (define start-prove (sexp->html '(button ([class "btn btn-primary"]
                                           [type "button"])
-                                         "开始论证")))
+                                        "开始论证")))
 (define bottom (sexp->html `(div ([class "d-grid gap-2 justify-content-sm-center"])
-                                 ,start-prove
-                                 ,(result-div))))
+                                ,start-prove
+                                ,(result-div))))
 
 (define (replace-result new-node)
   ($$ bottom.removeChild (result-div))
@@ -137,16 +140,16 @@
 
 (define container ($$ document.querySelector "div.container"))
 (define main `(div ([class "px-4 py-5 my-5 text-center"])
-                   (h1 ([class "display-5 fw-bold text-body-emphasis"]) "恶臭数字论证器")
-                   (h3 (a ([href "https://github.com/zvmsbackend/homo.js"]) (i ([class "bi bi-github"]))))
-                   (div ([class "col-lg-6 mx-auto"])
+                  (h1 ([class "display-5 fw-bold text-body-emphasis"]) "恶臭数字论证器")
+                  (h3 (a ([href "https://github.com/zvmsbackend/homo.js"]) (i ([class "bi bi-github"]))))
+                  (div ([class "col-lg-6 mx-auto"])
                         ,source-input
                         (h3 "=")
                         ,target-input
                         (div ([class "form-check form-switch"])
-                             ,all-input
-                             (label ([class "form-check-label"]
-                                     [for "all"])
+                            ,all-input
+                            (label ([class "form-check-label"]
+                                    [for "all"])
                                     "给出全部结果"))
                         ,bottom)))
 
@@ -156,27 +159,31 @@
     (lambda (e)
       (define source (get-ints (format "~a" ($ source-input 'value))))
       (define target (string->number (format "~a" ($ target-input 'value))))
+      (define past ($$ Date.now))
       (cond
         [($ all-input 'checked)
-         (define result (prove-all source target))
-         (define-values (exprs. count)
-           (for/fold ([exprs null]
+        (define result (prove-all source target))
+        (define-values (exprs. count)
+          (for/fold ([exprs null]
                       [count 0])
-                     ([r result])
-             (values (cons (->infix source r) exprs) (+ count 1))))
-         (define exprs (remove-duplicates exprs.))
-         (replace-result (sexp->html
+                    ([r result])
+            (values (cons (->infix source r) exprs) (+ count 1))))
+        (define exprs (remove-duplicates exprs.))
+        (replace-result (sexp->html
                           (if (= count 0)
                               "什么都没有(恼"
                               `(div
                                 (h4 "共有" ,count "个结果")
+                                (h6 "耗时" ,($/binop - ($$ Date.now) past) "毫秒")
                                 (ul ([class "list-group"])
                                     ,@(for/list ([expr exprs])
                                         `(li ([class "list-group-item"])
-                                             (pre ,(format "~a = ~a" target expr)))))))))]
+                                            (pre ,(format "~a = ~a" target expr)))))))))]
         [else
-         (define result (prove source target))
-         (replace-result (sexp->html
+        (define result (prove source target))
+        (replace-result (sexp->html
                           (if result
-                              `(pre ,(format "~a = ~a" target (->infix source result)))
+                              `(div
+                                (h6 "耗时" ,($/binop - ($$ Date.now) past) "毫秒")
+                                (pre ,(format "~a = ~a" target (->infix source result))))
                               "什么都没有(恼")))])))
